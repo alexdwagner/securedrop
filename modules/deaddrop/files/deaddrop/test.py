@@ -12,30 +12,37 @@ import gnupg
 from flask import session, g, escape
 from flask_testing import TestCase
 from flask_wtf import CsrfProtect
-# TODO: I think BeautifulSoup is the #1 reason these tests are so slow. Switch
-# to lxml per comment in last paragraph of
-# http://www.crummy.com/software/BeautifulSoup/bs4/doc/#css-selectors
 from bs4 import BeautifulSoup
 
 # Set the environment variable so config.py uses a test environment
 os.environ['DEADDROPENV'] = 'test'
-import config, crypto
+import config, crypto_util, store
 
 import source, store, journalist
 
 def _block_on_reply_keypair_gen(codename):
-    sid = crypto.shash(codename)
-    while not crypto.getkey(sid): sleep(0.1)
+    sid = crypto_util.shash(codename)
+    while not crypto_util.getkey(sid): sleep(0.1)
+
+def _setup_test_docs(sid, files):
+    filenames = [ os.path.join(config.STORE_DIR, sid, file) for file in files ]
+    for filename in filenames:
+        dirname = os.path.dirname(filename)
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
+        with open(filename, 'w') as fp:
+            fp.write('test')
+    return filenames
 
 def shared_setup():
     """Set up the file system and GPG"""
     # Create directories for the file store and the GPG keyring
-    for d in (config.TEST_DIR, config.STORE_DIR, config.GPG_KEY_DIR):
+    for d in (config.TEST_DIR, config.STORE_DIR, config.GPG_KEY_DIR, config.TEMP_DIR):
         try:
             os.mkdir(d)
         except OSError:
             # some of these dirs already exist because we import source and
-            # journalist, which import crypto, which calls gpg.GPG at module
+            # journalist, which import crypto_util, which calls gpg.GPG at module
             # level, which auto-generates the GPG homedir if it does not exist
             pass
     # Initialize the GPG keyring
@@ -156,8 +163,6 @@ class TestSource(TestCase):
         ), follow_redirects=True)
         self.assert200(rv)
         self.assertIn("Thanks! We received your message.", rv.data)
-        # Wait until the reply keypair is generated to avoid confusing errors
-        _block_on_reply_keypair_gen(codename)
 
     def test_submit_file(self):
         codename = self._new_codename()
@@ -168,7 +173,6 @@ class TestSource(TestCase):
         self.assert200(rv)
         self.assertIn(escape("Thanks! We received your document 'test.txt'."),
                 rv.data)
-        _block_on_reply_keypair_gen(codename)
 
     def test_submit_both(self):
         codename = self._new_codename()
@@ -180,16 +184,18 @@ class TestSource(TestCase):
         self.assertIn("Thanks! We received your message.", rv.data)
         self.assertIn(escape("Thanks! We received your document 'test.txt'."),
                 rv.data)
-        _block_on_reply_keypair_gen(codename)
+
+    def test_tor2web_warning(self):
+        rv = self.client.get('/', headers=[('X-tor2web', 'encrypted')])
+        self.assert200(rv)
+        self.assertIn("You appear to be using Tor2Web.", rv.data)
 
 class TestJournalist(TestCase):
 
-    @classmethod
-    def setUpClass(cls):
+    def setUp(self):
         shared_setup()
 
-    @classmethod
-    def tearDownClass(cls):
+    def tearDown(self):
         shared_teardown()
 
     def create_app(self):
@@ -206,6 +212,19 @@ class TestJournalist(TestCase):
         self.assert200(rv)
         self.assertIn("Latest submissions", rv.data)
         self.assertIn("No documents have been submitted!", rv.data)
+
+    def test_bulk_download(self):
+        sid = 'EQZGCJBRGISGOTC2NZVWG6LILJBHEV3CINNEWSCLLFTUWZJPKJFECLS2NZ4G4U3QOZCFKTTPNZMVIWDCJBBHMUDBGFHXCQ3R'
+        files = ['abc1_msg.gpg', 'abc2_msg.gpg']
+        filenames = _setup_test_docs(sid, files)
+
+        rv = self.client.post('/bulk', data=dict(
+            action='download',
+            sid=sid,
+            doc_names_selected=filenames
+        ))
+        
+        self.assertEqual(rv.status_code, 200)
 
 class TestIntegration(unittest.TestCase):
 
@@ -230,6 +249,7 @@ class TestIntegration(unittest.TestCase):
             rv = source_app.get('/generate')
             rv = source_app.post('/create', follow_redirects=True)
             codename = session['codename']
+            sid = g.sid
         # redirected to submission form
         rv = self.source_app.post('/submit', data=dict(
             msg=test_msg,
@@ -257,7 +277,38 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(decrypted_data.ok)
         self.assertEqual(decrypted_data.data, test_msg)
 
-        _block_on_reply_keypair_gen(codename)
+        # delete submission
+        rv = self.journalist_app.get(col_url)
+        self.assertEqual(rv.status_code, 200)
+        soup = BeautifulSoup(rv.data)
+        doc_name = soup.select('ul > li > input[name="doc_names_selected"]')[0]['value']
+        rv = self.journalist_app.post('/bulk', data=dict(
+            action='delete',
+            sid=sid,
+            doc_names_selected=doc_name
+        ))
+
+        self.assertEqual(rv.status_code, 200)
+        soup = BeautifulSoup(rv.data)
+        self.assertIn("The following file has been selected for", rv.data)
+
+        # confirm delete submission
+        doc_name = soup.select
+        doc_name = soup.select('ul > li > input[name="doc_names_selected"]')[0]['value']
+        rv = self.journalist_app.post('/bulk', data=dict(
+            action='delete',
+            sid=sid,
+            doc_names_selected=doc_name,
+            confirm_delete="1"
+        ))
+        self.assertEqual(rv.status_code, 200)
+        soup = BeautifulSoup(rv.data)
+        self.assertIn("File permanently deleted.", rv.data)
+
+        # confirm that submission deleted and absent in list of submissions
+        rv = self.journalist_app.get(col_url)
+        self.assertEqual(rv.status_code, 200)
+        self.assertIn("No documents to display.", rv.data)
 
     def test_submit_file(self):
         """When a source creates an account, test that a new entry appears in the journalist interface"""
@@ -268,6 +319,7 @@ class TestIntegration(unittest.TestCase):
             rv = source_app.get('/generate')
             rv = source_app.post('/create', follow_redirects=True)
             codename = session['codename']
+            sid = g.sid
         # redirected to submission form
         rv = self.source_app.post('/submit', data=dict(
             msg="",
@@ -293,9 +345,46 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(rv.status_code, 200)
         decrypted_data = self.gpg.decrypt(rv.data)
         self.assertTrue(decrypted_data.ok)
-        self.assertEqual(decrypted_data.data, test_file_contents)
 
-        _block_on_reply_keypair_gen(codename)
+        s = StringIO(decrypted_data.data)
+        zip_file = zipfile.ZipFile(s, 'r')
+        unzipped_decrypted_data = zip_file.read('test.txt')
+        zip_file.close()
+
+        self.assertEqual(unzipped_decrypted_data, test_file_contents)
+
+        # delete submission
+        rv = self.journalist_app.get(col_url)
+        self.assertEqual(rv.status_code, 200)
+        soup = BeautifulSoup(rv.data)
+        doc_name = soup.select('ul > li > input[name="doc_names_selected"]')[0]['value']
+        rv = self.journalist_app.post('/bulk', data=dict(
+            action='delete',
+            sid=sid,
+            doc_names_selected=doc_name
+        ))
+
+        self.assertEqual(rv.status_code, 200)
+        soup = BeautifulSoup(rv.data)
+        self.assertIn("The following file has been selected for", rv.data)
+
+        # confirm delete submission
+        doc_name = soup.select
+        doc_name = soup.select('ul > li > input[name="doc_names_selected"]')[0]['value']
+        rv = self.journalist_app.post('/bulk', data=dict(
+            action='delete',
+            sid=sid,
+            doc_names_selected=doc_name,
+            confirm_delete="1"
+        ))
+        self.assertEqual(rv.status_code, 200)
+        soup = BeautifulSoup(rv.data)
+        self.assertIn("File permanently deleted.", rv.data)
+
+        # confirm that submission deleted and absent in list of submissions
+        rv = self.journalist_app.get(col_url)
+        self.assertEqual(rv.status_code, 200)
+        self.assertIn("No documents to display.", rv.data)
 
     def test_reply(self):
         test_msg = "This is a test message."
@@ -305,6 +394,7 @@ class TestIntegration(unittest.TestCase):
             rv = source_app.get('/generate')
             rv = source_app.post('/create', follow_redirects=True)
             codename = session['codename']
+            flagged = session['flagged']
             sid = g.sid
         # redirected to submission form
         rv = self.source_app.post('/submit', data=dict(
@@ -312,6 +402,7 @@ class TestIntegration(unittest.TestCase):
             fh=(StringIO(''), ''),
         ), follow_redirects=True)
         self.assertEqual(rv.status_code, 200)
+        self.assertFalse(flagged)
 
         rv = self.journalist_app.get('/')
         self.assertEqual(rv.status_code, 200)
@@ -321,12 +412,32 @@ class TestIntegration(unittest.TestCase):
 
         rv = self.journalist_app.get(col_url)
         self.assertEqual(rv.status_code, 200)
+
+        with self.source_app as source_app:
+            rv = source_app.post('/login', data=dict(
+                codename=codename), follow_redirects=True)
+            self.assertEqual(rv.status_code, 200)
+            self.assertFalse(session['flagged'])
+
+        rv = self.journalist_app.post('/flag', data=dict(
+            sid=sid))
+        self.assertEqual(rv.status_code, 200)
+
+        with self.source_app as source_app:
+            rv = source_app.post('/login', data=dict(
+                codename=codename), follow_redirects=True)
+            self.assertEqual(rv.status_code, 200)
+            self.assertTrue(session['flagged'])
+            source_app.get('/lookup')
+            self.assertTrue(g.flagged)
+
         # Block until the reply keypair has been generated, so we can test
         # sending a reply
         _block_on_reply_keypair_gen(codename)
+
         rv = self.journalist_app.post('/reply', data=dict(
             sid=sid,
-            msg=test_reply,
+            msg=test_reply
         ))
         self.assertEqual(rv.status_code, 200)
         self.assertIn("Thanks! Your reply has been stored.", rv.data)
@@ -334,6 +445,7 @@ class TestIntegration(unittest.TestCase):
         rv = self.journalist_app.get(col_url)
         self.assertIn("reply-", rv.data)
 
+        _block_on_reply_keypair_gen(codename)
         rv = self.source_app.get('/lookup')
         self.assertEqual(rv.status_code, 200)
         self.assertIn("You have received a reply. For your security, please delete all replies when you're done with them.", rv.data)
@@ -350,10 +462,28 @@ class TestIntegration(unittest.TestCase):
 
 class TestStore(unittest.TestCase):
     '''The set of tests for store.py.'''
+    @classmethod
+    def setUp(self):
+        shared_setup()
+
+    @classmethod
+    def tearDown(self):
+        shared_teardown()
+
     def test_verify(self):
         with self.assertRaises(store.PathException):
             store.verify(os.path.join(config.STORE_DIR, '..', 'etc', 'passwd'))
 
+    def test_get_zip(self):
+        sid = 'EQZGCJBRGISGOTC2NZVWG6LILJBHEV3CINNEWSCLLFTUWZJPKJFECLS2NZ4G4U3QOZCFKTTPNZMVIWDCJBBHMUDBGFHXCQ3R'
+        files = ['abc1_msg.gpg', 'abc2_msg.gpg']
+        filenames = _setup_test_docs(sid, files)
+
+        zip = store.get_bulk_archive(filenames)
+
+        zipfile_contents = zipfile.ZipFile(zip).namelist()
+        for file in files:
+            self.assertIn(file, zipfile_contents)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
