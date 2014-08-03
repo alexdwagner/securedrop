@@ -194,7 +194,7 @@ class TestSource(unittest.TestCase):
         self.assertIn(source.SUBMIT_MSG_NOTIFY_STR, rv.data)
         self.assertIn(escape("%s '%s'. %s" % (source.SUBMIT_DOC_NOTIFY_STR, 'test.txt', source.SUBMIT_CODENAME_NOTIFY_STR)), rv.data)
 
-    def test_submit_clean_file(self):
+    def test_submit_image_file(self):
         img = open(os.getcwd()+'/tests/test_images/clean.jpg')
         codename = self._new_codename()
         rv = self.client.post('/submit', data=dict(
